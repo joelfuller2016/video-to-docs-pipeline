@@ -1,0 +1,173 @@
+{
+  "name": "Video to Documentation Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "/input/videos",
+        "watchFolder": true
+      },
+      "id": "1",
+      "name": "File Trigger",
+      "type": "n8n-nodes-base.fileWatcher",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "process-video",
+        "responseMode": "responseNode"
+      },
+      "id": "2",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 120],
+      "webhookId": "process-video"
+    },
+    {
+      "parameters": {
+        "command": "ffmpeg -i {{$json.filePath}} -vn -acodec pcm_s16le -ar 44100 -ac 2 {{$json.tempDir}}/audio.wav"
+      },
+      "id": "3",
+      "name": "Extract Audio",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "command": "whisper {{$json.tempDir}}/audio.wav --model base --output_format json --output_dir {{$json.tempDir}}"
+      },
+      "id": "4",
+      "name": "Whisper Transcription",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Analyze transcription for key moments\nconst fs = require('fs');\nconst transcriptionPath = items[0].json.tempDir + '/audio.json';\nconst transcription = JSON.parse(fs.readFileSync(transcriptionPath, 'utf8'));\n\n// Simple analysis - identify sentences with action words\nconst actionWords = ['click', 'press', 'select', 'choose', 'open', 'close', 'drag', 'drop', 'type', 'enter'];\nconst keyMoments = [];\n\ntranscription.segments.forEach(segment => {\n  const text = segment.text.toLowerCase();\n  const hasActionWord = actionWords.some(word => text.includes(word));\n  \n  if (hasActionWord || segment.text.includes('step') || segment.text.includes('now')) {\n    keyMoments.push({\n      timestamp: segment.start,\n      text: segment.text,\n      importance: hasActionWord ? 'high' : 'medium'\n    });\n  }\n});\n\nreturn [{\n  json: {\n    ...items[0].json,\n    keyMoments,\n    transcriptionPath\n  }\n}];"
+      },
+      "id": "5",
+      "name": "Analyze Content",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Extract screenshots at key moments\nconst { exec } = require('child_process');\nconst fs = require('fs');\nconst path = require('path');\n\nconst keyMoments = items[0].json.keyMoments;\nconst videoPath = items[0].json.filePath;\nconst outputDir = items[0].json.tempDir + '/screenshots';\n\n// Create screenshots directory\nif (!fs.existsSync(outputDir)) {\n  fs.mkdirSync(outputDir, { recursive: true });\n}\n\nconst promises = keyMoments.map((moment, index) => {\n  return new Promise((resolve, reject) => {\n    const outputFile = path.join(outputDir, `screenshot_${index}.png`);\n    const command = `ffmpeg -i \"${videoPath}\" -ss ${moment.timestamp} -vframes 1 -y \"${outputFile}\"`;\n    \n    exec(command, (error, stdout, stderr) => {\n      if (error) {\n        reject(error);\n      } else {\n        resolve({\n          timestamp: moment.timestamp,\n          text: moment.text,\n          imagePath: outputFile,\n          importance: moment.importance\n        });\n      }\n    });\n  });\n});\n\nPromise.all(promises).then(screenshots => {\n  return [{\n    json: {\n      ...items[0].json,\n      screenshots,\n      screenshotsDir: outputDir\n    }\n  }];\n}).catch(error => {\n  throw new Error(`Screenshot extraction failed: ${error.message}`);\n});"
+      },
+      "id": "6",
+      "name": "Extract Screenshots",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Generate final documentation\nconst fs = require('fs');\nconst path = require('path');\n\nconst screenshots = items[0].json.screenshots;\nconst transcriptionPath = items[0].json.transcriptionPath;\nconst outputDir = items[0].json.outputDir || '/output/docs';\nconst videoName = path.basename(items[0].json.filePath, path.extname(items[0].json.filePath));\n\n// Ensure output directory exists\nif (!fs.existsSync(outputDir)) {\n  fs.mkdirSync(outputDir, { recursive: true });\n}\n\n// Read transcription\nconst transcription = JSON.parse(fs.readFileSync(transcriptionPath, 'utf8'));\n\n// Generate markdown documentation\nlet markdown = `# ${videoName} - How-To Guide\\n\\n`;\nmarkdown += `Generated from video: ${items[0].json.filePath}\\n`;\nmarkdown += `Generated on: ${new Date().toISOString()}\\n\\n`;\nmarkdown += `## Overview\\n\\n`;\nmarkdown += `This guide was automatically generated from the video content using AI transcription and analysis.\\n\\n`;\nmarkdown += `## Instructions\\n\\n`;\n\nscreenshots.forEach((screenshot, index) => {\n  markdown += `### Step ${index + 1}\\n\\n`;\n  markdown += `**Timestamp:** ${Math.floor(screenshot.timestamp / 60)}:${String(Math.floor(screenshot.timestamp % 60)).padStart(2, '0')}\\n\\n`;\n  markdown += `${screenshot.text}\\n\\n`;\n  markdown += `![Step ${index + 1}](${path.relative(outputDir, screenshot.imagePath)})\\n\\n`;\n  markdown += `---\\n\\n`;\n});\n\nmarkdown += `## Complete Transcription\\n\\n`;\ntranscription.segments.forEach(segment => {\n  const timestamp = `${Math.floor(segment.start / 60)}:${String(Math.floor(segment.start % 60)).padStart(2, '0')}`;\n  markdown += `**[${timestamp}]** ${segment.text}\\n\\n`;\n});\n\n// Write documentation file\nconst docPath = path.join(outputDir, `${videoName}-guide.md`);\nfs.writeFileSync(docPath, markdown);\n\nreturn [{\n  json: {\n    ...items[0].json,\n    documentationPath: docPath,\n    success: true,\n    message: `Documentation generated successfully: ${docPath}`\n  }\n}];"
+      },
+      "id": "7",
+      "name": "Generate Documentation",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Initialize processing variables\nconst path = require('path');\nconst { v4: uuidv4 } = require('uuid');\n\nconst videoPath = items[0].json.filePath || items[0].json.videoPath;\nconst processingId = uuidv4();\nconst tempDir = `/tmp/video-processing-${processingId}`;\nconst outputDir = items[0].json.outputDir || '/output/docs';\n\nreturn [{\n  json: {\n    processingId,\n    filePath: videoPath,\n    tempDir,\n    outputDir,\n    startedAt: new Date().toISOString(),\n    notificationWebhook: process.env.NOTIFICATION_WEBHOOK\n  }\n}];"
+      },
+      "id": "8",
+      "name": "Initialize",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [460, 120]
+    }
+  ],
+  "connections": {
+    "File Trigger": {
+      "main": [
+        [
+          {
+            "node": "Extract Audio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Initialize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Audio": {
+      "main": [
+        [
+          {
+            "node": "Whisper Transcription",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Whisper Transcription": {
+      "main": [
+        [
+          {
+            "node": "Analyze Content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyze Content": {
+      "main": [
+        [
+          {
+            "node": "Extract Screenshots",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Screenshots": {
+      "main": [
+        [
+          {
+            "node": "Generate Documentation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Initialize": {
+      "main": [
+        [
+          {
+            "node": "Extract Audio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "timezone": "America/New_York"
+  },
+  "versionId": "1"
+}
